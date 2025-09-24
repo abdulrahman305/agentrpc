@@ -1,13 +1,19 @@
-import debug from "debug";
-import path from "path";
+/**
+ * @license
+ * Copyright 2025 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+import path from "node:path";
 import { z } from "zod";
-import { createApiClient } from "./create-client";
+import { JSONRPCClient } from "json-rpc-2.0";
 import { AgentRPCError } from "./errors";
 import { machineId } from "./machine-id";
-import { PollingAgent, registerMachine, createAndPollJob } from "./polling";
+import { PollingAgent, createAndPollJob } from "./polling";
 import { ToolRegistrationInput, JsonSchemaInput } from "./types";
 
-import OpenAI from "openai";
+import debug from "debug"; // Added import for debug
+import OpenAI from "openai"; // Revert to default import for the class
+import { ChatCompletionTool, ChatCompletionMessageToolCall } from "openai/resources/chat/completions";
 
 // Custom json formatter
 debug.formatters.J = (json) => {
@@ -42,7 +48,6 @@ export const log = debug("agentrpc:client");
  */
 export class AgentRPC {
   static getVersion(): string {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
     return require(path.join(__dirname, "..", "package.json")).version;
   }
 
@@ -52,11 +57,13 @@ export class AgentRPC {
   private endpoint: string;
   private machineId: string;
 
-  private client: ReturnType<typeof createApiClient>;
+  public jsonRpcClient: JSONRPCClient;
 
   private pollingAgents: PollingAgent[] = [];
 
-  private toolsRegistry: { [key: string]: ToolRegistrationInput<any> } = {};
+  private toolsRegistry: {
+    [key: string]: ToolRegistrationInput<z.ZodTypeAny | JsonSchemaInput>;
+  } = {};
 
   /**
    * Initializes a new AgentRPC instance.
@@ -76,6 +83,10 @@ export class AgentRPC {
     apiSecret?: string;
     endpoint?: string;
     machineId?: string;
+    mcpUuid?: string;
+    mcpApp?: string;
+    mcpSessionId?: string; // New parameter
+    mcpChatId?: string; // New parameter
   }) {
     const apiSecret = options?.apiSecret;
 
@@ -93,31 +104,67 @@ export class AgentRPC {
     }
 
     this.endpoint = options?.endpoint || "https://api.agentrpc.com";
+    const mcpUuid = options?.mcpUuid;
+    const mcpApp = options?.mcpApp;
+
+    if (this.endpoint !== "https://api.agentrpc.com" && !mcpUuid) {
+      throw new AgentRPCError(
+        `mcpUuid is required when a custom endpoint is provided.`,
+      );
+    }
 
     this.machineId = options?.machineId || machineId();
 
-    this.client = createApiClient({
-      baseUrl: this.endpoint,
-      machineId: this.machineId,
-      apiSecret: this.apiSecret,
+    this.jsonRpcClient = new JSONRPCClient((jsonRPCRequest) => {
+      let url = `${this.endpoint}/json-rpc`;
+      if (mcpUuid) {
+        url = `${this.endpoint}/v1/${mcpUuid}`;
+        if (mcpApp) {
+          url = `${url}/${mcpApp}`;
+        }
+      }
+
+      return fetch(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: this.apiSecret,
+          ...(options?.mcpSessionId && {
+            "mcp-session-id": options.mcpSessionId,
+          }),
+          ...(options?.mcpChatId && { "x-pd-mcp-chat-id": options.mcpChatId }),
+        },
+        body: JSON.stringify(jsonRPCRequest),
+      }).then((response) => {
+        if (response.status === 200) {
+          // Use client.receive when you received a JSON-RPC response.
+          return response
+            .json()
+            .then((jsonRPCResponse) =>
+              this.jsonRpcClient.receive(jsonRPCResponse),
+            );
+        } else if (jsonRPCRequest.id !== undefined) {
+          return Promise.reject(new Error(response.statusText));
+        }
+      });
     });
   }
 
   public OpenAI = {
-    getTools: async (): Promise<OpenAI.ChatCompletionTool[]> => {
+    getTools: async (): Promise<ChatCompletionTool[]> => {
       const clusterId = this.clusterId;
 
-      const toolResponse = await this.client.listTools({
-        params: { clusterId },
+      const toolResponse = await this.jsonRpcClient.request("listTools", {
+        clusterId,
       });
 
-      if (toolResponse.status !== 200) {
-        throw new Error(
-          `Failed to list AgentRPC tools: ${toolResponse.status}`,
-        );
+      interface Tool {
+        name: string;
+        description: string | null;
+        schema: string | null;
       }
 
-      const tools = toolResponse.body.map((tool) => ({
+      const tools = toolResponse.map((tool: Tool) => ({
         type: "function" as const,
         function: {
           name: tool.name,
@@ -128,7 +175,7 @@ export class AgentRPC {
 
       return tools;
     },
-    executeTool: async (toolCall: OpenAI.ChatCompletionMessageToolCall) => {
+    executeTool: async (toolCall: ChatCompletionMessageToolCall) => {
       const clusterId = this.clusterId;
 
       const tools = await this.OpenAI.getTools();
@@ -140,8 +187,8 @@ export class AgentRPC {
         throw new Error(`Tool not found: ${toolCall.function.name}`);
       }
 
-      const { status, result, resultType } = await createAndPollJob(
-        this.client,
+      const { result, resultType } = await createAndPollJob(
+        this.jsonRpcClient,
         clusterId,
         tool.function.name,
         JSON.parse(toolCall.function.arguments),
@@ -196,11 +243,9 @@ export class AgentRPC {
 
     // TODO: Create one polling agent per 10 tools
     const agent = new PollingAgent({
-      endpoint: this.endpoint,
-      machineId: this.machineId,
-      apiSecret: this.apiSecret,
       clusterId: this.clusterId,
       tools: Object.values(this.toolsRegistry),
+      jsonRpcClient: this.jsonRpcClient,
     });
 
     this.pollingAgents.push(agent);

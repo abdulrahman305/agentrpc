@@ -27,7 +27,8 @@
     "openai": "^4.87.3",
     "prettier": "^3.3.3",
     "zod": "^3.23.5",
-    "zod-to-json-schema": "^3.23.5"
+    "zod-to-json-schema": "^3.23.5",
+    "json-rpc-2.0": "1.7.1"
   },
   "devDependencies": {
     "@babel/preset-env": "^7.26.0",

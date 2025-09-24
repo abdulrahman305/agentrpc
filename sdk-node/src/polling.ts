@@ -1,10 +1,16 @@
+/**
+ * @license
+ * Copyright 2025 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 import debug from "debug";
 import { z } from "zod";
-import { createApiClient } from "./create-client";
-import { AgentRPCAPIError, AgentRPCError } from "./errors";
+import { JSONRPCClient } from "json-rpc-2.0";
+import { AgentRPCError } from "./errors";
 import { serializeError } from "./serialize-error";
 import { executeFn, Result } from "./execute-fn";
-import { ToolRegistrationInput } from "./types";
+import { ToolRegistrationInput, JsonSchemaInput } from "./types";
 import { isZodType, validateFunctionArgs } from "./util";
 import zodToJsonSchema from "zod-to-json-schema";
 
@@ -22,33 +28,25 @@ export class PollingAgent {
   public clusterId: string;
   public polling = false;
 
-  private tools: ToolRegistrationInput<any>[] = [];
+  private tools: ToolRegistrationInput<z.ZodTypeAny | JsonSchemaInput>[] = [];
 
-  private client: ReturnType<typeof createApiClient>;
+  private jsonRpcClient: JSONRPCClient;
 
   private retryAfter = DEFAULT_RETRY_AFTER_SECONDS;
 
   constructor(options: {
-    endpoint: string;
-    machineId: string;
-    apiSecret: string;
     clusterId: string;
-    tools: ToolRegistrationInput<any>[];
+    tools: ToolRegistrationInput<z.ZodTypeAny | JsonSchemaInput>[];
+    jsonRpcClient: JSONRPCClient;
   }) {
-    this.client = createApiClient({
-      baseUrl: options.endpoint,
-      machineId: options.machineId,
-      apiSecret: options.apiSecret,
-    });
-
     this.tools = options.tools;
-
     this.clusterId = options.clusterId;
+    this.jsonRpcClient = options.jsonRpcClient;
   }
 
   public async start() {
     log("Starting polling agent");
-    await registerMachine(this.client, this.tools);
+    await registerMachine(this.jsonRpcClient, this.tools);
 
     // Purposefully not awaited
     this.runLoop();
@@ -93,37 +91,17 @@ export class PollingAgent {
 
     const tools = this.tools.map((fn) => fn.name);
 
-    const pollResult = await this.client.listJobs({
-      params: {
-        clusterId: this.clusterId,
-      },
-      query: {
-        tools: tools.join(","),
-        status: "pending",
-        acknowledge: true,
-        limit: 10,
-        waitTime: 20,
-      },
+    const pollResult = await this.jsonRpcClient.request("listJobs", {
+      clusterId: this.clusterId,
+      tools: tools.join(","),
+      status: "pending",
+      acknowledge: true,
+      limit: 10,
+      waitTime: 20,
     });
 
-    const retryAfterHeader = pollResult.headers.get("retry-after");
-    if (retryAfterHeader && !isNaN(Number(retryAfterHeader))) {
-      this.retryAfter = Number(retryAfterHeader);
-    }
-
-    if (pollResult?.status === 410) {
-      await registerMachine(this.client, this.tools);
-    }
-
-    if (pollResult?.status !== 200) {
-      throw new AgentRPCError("Failed to fetch calls", {
-        status: pollResult?.status,
-        body: pollResult?.body,
-      });
-    }
-
     const results = await Promise.allSettled(
-      pollResult.body.map(async (job) => {
+      pollResult.map(async (job: JobMessage) => {
         await this.processCall(job);
       }),
     );
@@ -159,30 +137,15 @@ export class PollingAgent {
         functionExecutionTime: result.functionExecutionTime,
       });
 
-      await this.client
-        .createJobResult({
-          body: {
-            result: result.content,
-            resultType: result.type,
-            meta: {
-              functionExecutionTime: result.functionExecutionTime,
-            },
-          },
-          params: {
-            jobId: call.id,
-            clusterId: this.clusterId!,
-          },
-        })
-        .then(async (res) => {
-          if (res.status === 204) {
-            log("Completed job", call.id, call.function);
-          } else {
-            throw new AgentRPCError(`Failed to persist call: ${res.status}`, {
-              jobId: call.id,
-              body: JSON.stringify(res.body),
-            });
-          }
-        });
+      await this.jsonRpcClient.request("createJobResult", {
+        jobId: call.id,
+        clusterId: this.clusterId!,
+        result: result.content,
+        resultType: result.type,
+        meta: {
+          functionExecutionTime: result.functionExecutionTime,
+        },
+      });
     };
 
     const args = call.input;
@@ -240,37 +203,30 @@ export class PollingAgent {
 }
 
 export const registerMachine = async (
-  client: ReturnType<typeof createApiClient>,
-  tools?: ToolRegistrationInput<any>[],
+  client: JSONRPCClient,
+  tools?: ToolRegistrationInput<z.ZodTypeAny | JsonSchemaInput>[],
 ) => {
   log("registering machine", {
     tools: tools?.map((f) => f.name),
   });
-  const registerResult = await client.createMachine({
-    body: {
-      tools: tools?.map((func) => ({
-        name: func.name,
-        description: func.description,
-        schema: JSON.stringify(
-          isZodType(func.schema) ? zodToJsonSchema(func.schema) : func.schema,
-        ),
-        config: func.config,
-      })),
-    },
+  const registerResult = await client.request("createMachine", {
+    tools: tools?.map((func) => ({
+      name: func.name,
+      description: func.description,
+      schema: JSON.stringify(
+        isZodType(func.schema) ? zodToJsonSchema(func.schema) : func.schema,
+      ),
+      config: func.config,
+    })),
   });
 
-  if (registerResult?.status !== 200) {
-    log("Failed to register machine", registerResult);
-    throw new AgentRPCAPIError("Failed to register machine", registerResult);
-  }
-
   return {
-    clusterId: registerResult.body.clusterId,
+    clusterId: registerResult.clusterId,
   };
 };
 
 export const pollForJobCompletion = async (
-  client: ReturnType<typeof createApiClient>,
+  client: JSONRPCClient,
   clusterId: string,
   jobId: string,
   initialStatus?: string | null,
@@ -286,16 +242,13 @@ export const pollForJobCompletion = async (
   let resultType: string = initialResultType;
 
   while (!status || !["failure", "done"].includes(status)) {
-    const details = await client.getJob({
-      params: { clusterId, jobId },
-      query: { waitTime: 20 },
+    const details = await client.request("getJob", {
+      clusterId,
+      jobId,
+      waitTime: 20,
     });
 
-    if (details.status !== 200) {
-      throw new AgentRPCError(`Failed to fetch job details: ${details.status}`);
-    }
-
-    const body = details.body;
+    const body = details;
     status = body.status;
     result = body.result || "";
     resultType = body.resultType || "rejection";
@@ -307,37 +260,28 @@ export const pollForJobCompletion = async (
 };
 
 export const createAndPollJob = async (
-  client: ReturnType<typeof createApiClient>,
+  client: JSONRPCClient,
   clusterId: string,
   toolName: string,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  input: any,
+  input: unknown,
 ): Promise<{
   status: string;
   result: string;
   resultType: string;
 }> => {
-  const createResult = await client.createJob({
-    body: {
-      tool: toolName,
-      input,
-    },
-    params: { clusterId },
-    query: {
-      waitTime: 20,
-    },
+  const createResult = await client.request("createJob", {
+    tool: toolName,
+    input,
+    clusterId,
+    waitTime: 20,
   });
-
-  if (createResult.status !== 200) {
-    throw new AgentRPCError(`Failed to run tool: ${createResult.status}`);
-  }
 
   return pollForJobCompletion(
     client,
     clusterId,
-    createResult.body.id,
-    createResult.body.status,
-    createResult.body.result || "",
-    createResult.body.resultType || "rejection",
+    createResult.id,
+    createResult.status,
+    createResult.result || "",
+    createResult.resultType || "rejection",
   );
 };

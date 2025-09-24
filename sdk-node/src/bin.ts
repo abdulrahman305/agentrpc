@@ -20,8 +20,18 @@ if (!apiSecret) {
   process.exit(1);
 }
 
+import { AgentRPC } from "./agentrpc"; // Import AgentRPC
+
 const client = createApiClient({
   apiSecret,
+});
+
+// Create an AgentRPC instance
+const agentrpcInstance = new AgentRPC({
+  apiSecret,
+  endpoint: process.env.AGENTRPC_ENDPOINT, // Use environment variable for endpoint
+  mcpUuid: process.env.MCP_UUID, // Use environment variable for mcpUuid
+  mcpApp: process.env.MCP_APP, // Use environment variable for mcpApp
 });
 
 // Create server instance
@@ -41,6 +51,7 @@ async function main() {
       process.exit(1);
     }
 
+  // Use the ts-rest client to list tools
   const toolResponse = await client.listTools({
     params: {
       clusterId,
@@ -65,7 +76,7 @@ async function main() {
       async (i) => {
         try {
           const { status, result, resultType } = await createAndPollJob(
-            client,
+            agentrpcInstance.jsonRpcClient, // Pass the JSONRPCClient from AgentRPC instance
             clusterId,
             tool.name,
             i,
